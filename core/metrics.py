@@ -140,59 +140,166 @@ def retention_funnel(t: dict) -> pd.DataFrame:
     7주차 토요일에 겪은 생존 편향이 여기서 다시 나온다.
 
     반환: DataFrame[step, label, n, step_rate, cum_rate]
+
+    ────────────────────────────────────────────────────────────────
+    ★ 이 프로젝트 데이터에는 "과제"·"집행" 테이블이 따로 없다. 과제는
+    계약(contracts, contract_id 1건)으로, 집행은 그 계약의 월세 납부
+    (rent_payments 에서 paid == True) 로 놓았다. 다르게 정의했다면
+    아래 stage_contracts 부터 다시 봐야 한다.
+
+    그레인: 과제(계약) 1건. "지속" 판정만 예외적으로 대상×시간(첫 집행과
+    두 번째 집행 사이 간격)을 본다 — 착수·완주는 시점 하나의 상태다.
+    ────────────────────────────────────────────────────────────────
     """
-    todo("Day2 실습 D", "유지 퍼널",
-         "7주차에 정한 유지·이탈의 정의를 config.RETENTION_STEPS 에 옮기고 "
-         "그레인을 다시 확인하십시오.",
-         "core/metrics.py  retention_funnel()")
+    contracts, payments = t["contracts"], t["rent_payments"]
+    paid = payments[payments.paid.astype(bool)].copy()
+    paid["pm"] = to_dt(paid.payment_month)
+
+    paid_dates = (paid.sort_values("pm").groupby("contract_id")["pm"]
+                  .apply(lambda s: s.tolist()))
+
+    started = set(paid_dates.index)
+    continued = {cid for cid, dates in paid_dates.items()
+                 if len(dates) >= 2 and (dates[1] - dates[0]).days <= 90}
+    completed = set(contracts.loc[contracts.status != "계약중", "contract_id"])
+
+    stage_contracts = {"착수": started, "지속": continued, "완주": completed}
+
+    rows = []
+    prev_n = first_n = None
+    for step, _ in C.RETENTION_STEPS:
+        n = len(stage_contracts.get(step, set()))
+        first_n = n if first_n is None else first_n
+        rows.append({
+            "step": step, "label": step, "n": n,
+            "step_rate": (n / prev_n) if prev_n else np.nan,
+            "cum_rate": (n / first_n) if first_n else np.nan,
+        })
+        prev_n = n
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def churn(t: dict) -> dict:
+    """이탈 판정. 계약 기간이 끝난 뒤 재계약했는지로 본다.
+
+        유지  status == "재계약"
+        이탈  status in {"만료_미갱신", "중도해지"}
+
+    "계약중"(아직 기간이 안 끝난 계약)은 재계약 여부 자체가 아직 정해지지
+    않았으므로 분모에서 뺀다 — 유지도 이탈도 아니라 "아직 판정 불가"다.
+
+    다만 계약중인 것 중 마지막 집행(납부) 후 config.CHURN_INACTIVITY_DAYS
+    이상 무활동인 것은 위험 표시(at_risk)만 남긴다. 이탈로 세지는 않는다 —
+    계약 기간이 끝나 재계약을 안 한 것 같은 확정된 사건이 아니라 조짐일
+    뿐이라서다. 기준 시점(anchor)은 config.PERIOD 종료일이다.
+
+    반환: {"n_retained": int, "n_churned": int, "n_decided": int, "rate": float,
+           "retained_ids": set[str], "churned_ids": set[str],
+           "at_risk_ids": set[str]}
+    """
+    contracts, payments = t["contracts"], t["rent_payments"]
+
+    retained_ids = set(contracts.loc[contracts.status == "재계약", "contract_id"])
+    churned_ids = set(contracts.loc[
+        contracts.status.isin(["만료_미갱신", "중도해지"]), "contract_id"])
+    n_retained, n_churned = len(retained_ids), len(churned_ids)
+    n_decided = n_retained + n_churned
+
+    ongoing_ids = set(contracts.loc[contracts.status == "계약중", "contract_id"])
+    paid = payments[payments.paid.astype(bool)].copy()
+    paid["pm"] = to_dt(paid.payment_month)
+    last_paid = paid.groupby("contract_id")["pm"].max()
+    anchor = pd.Timestamp(C.PERIOD[1])
+    inactive_days = (anchor - last_paid).dt.days
+    at_risk_ids = {cid for cid in ongoing_ids
+                   if inactive_days.get(cid, 0) >= C.CHURN_INACTIVITY_DAYS}
+
+    return {
+        "n_retained": n_retained,
+        "n_churned": n_churned,
+        "n_decided": n_decided,
+        "rate": (n_churned / n_decided) if n_decided else np.nan,
+        "retained_ids": retained_ids,
+        "churned_ids": churned_ids,
+        "at_risk_ids": at_risk_ids,
+    }
 
 
 # ── KPI ───────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False)
 def kpis(t: dict) -> dict:
-    """지표 카드.
+    """지표 카드. 규모·전환·속도·품질 네 축에서 하나씩 뽑았다.
 
-    ★ Day2 실습 E에서 채웁니다.
-
-    ★ 아래 컬럼명은 전부 **통신사 것**이다. 내 데이터의 대응 컬럼으로 바꾼다.
-
-        billing_amount  →  금액에 해당하는 컬럼
-        is_churned      →  이탈 여부에 해당하는 컬럼
-
-    없는 지표는 **빼면 된다.** 4개일 이유가 없다.
+        리드 수      규모  leads 전체 건수
+        전환율       전환  계약까지 간 리드 비율 (lead_id 기준)
+        체결소요일    속도  문의 접수 ~ 계약 체결까지 걸린 일수 (중앙값)
+        납부이행률    품질  rent_payments 중 정상 납부(paid=True) 비율
 
     반환: {"지표이름": {"value": float, "unit": str, "fmt": str}}
-          fmt 은 화면 표시 형식이다. 예) "{:.2f}%"  "{:,.0f}원"
-
-    예시 — 통신사:
-
-        f = funnel(t["funnel_events"])
-        return {
-            "전환율": {"value": f.n.iloc[-1] / f.n.iloc[0] * 100,
-                       "unit": "%", "fmt": "{:.2f}%"},
-            "ARPU": {"value": float(t["usage_monthly"].billing_amount.mean()),
-                     "unit": "원", "fmt": "{:,.0f}원"},
-        }
     """
-    todo("Day2 실습 E", "지표 카드",
-         "내 데이터에서 금액·이탈에 해당하는 컬럼이 무엇입니까? 없는 지표는 빼십시오.",
-         "core/metrics.py  kpis()")
+    leads, contracts, payments = t["leads"], t["contracts"], t["rent_payments"]
+
+    n_leads = leads.lead_id.nunique()
+    n_contracted = contracts.lead_id.nunique()
+
+    lead_dates = to_dt(leads.set_index("lead_id")["inquiry_date"])
+    contract_dates = to_dt(contracts.set_index("lead_id")["contract_start_date"])
+    lead_to_contract_days = (
+        contract_dates - lead_dates.reindex(contract_dates.index)
+    ).dt.days
+
+    return {
+        "리드 수": {"value": float(n_leads), "unit": "건", "fmt": "{:,.0f}건"},
+        "전환율": {"value": (n_contracted / n_leads * 100) if n_leads else float("nan"),
+                  "unit": "%", "fmt": "{:.2f}%"},
+        "체결소요일": {"value": float(lead_to_contract_days.median()),
+                    "unit": "일", "fmt": "{:.1f}일"},
+        "납부이행률": {"value": float(payments.paid.astype(bool).mean() * 100),
+                    "unit": "%", "fmt": "{:.2f}%"},
+    }
 
 
 @st.cache_data(show_spinner=False)
 def monthly(t: dict) -> pd.DataFrame:
     """기간별 추이. 지표 카드의 스파크라인과 아카이브 비교에 쓴다.
 
-    ★ Day2 실습 E에서 채웁니다. (kpis 와 함께)
+    열 이름은 kpis() 의 지표 이름과 같다 — 이름으로 짝을 맞춰 스파크라인을 그린다.
 
-    kpis() 가 돌려주는 지표 이름과 **열 이름이 대응**되어야 스파크라인이 그려진다.
-    기간이 짧아 월별로 나눌 수 없으면 주별로 해도 되고, 아예 빼도 된다.
+        리드 수      그 달 접수된 리드 수
+        전환율       그 달 리드 중 (지금까지) 계약으로 이어진 비율
+                    ★ 최근 달일수록 아직 계약이 안 된 리드가 섞여 있어 낮게 보일 수 있다
+                    (관측 기간이 짧은 대상을 그대로 비교하는 문제 — retention_funnel과 동일)
+        체결소요일    그 달 체결된 계약의 문의~체결 소요일수 중앙값
+        납부이행률    그 달 납부 대상 중 정상 납부(paid=True) 비율
 
-    반환: 인덱스가 기간(예 "2025-01"), 열이 지표인 DataFrame
+    반환: 인덱스가 기간("2025-01"), 열이 지표인 DataFrame
     """
-    todo("Day2 실습 E", "기간별 추이",
-         "기간을 무엇으로 자릅니까? 월이 너무 길면 주로 자르십시오.",
-         "core/metrics.py  monthly()")
+    leads, contracts, payments = t["leads"], t["contracts"], t["rent_payments"]
+
+    lead_month = to_dt(leads.inquiry_date).dt.strftime("%Y-%m")
+    n_leads = leads.groupby(lead_month).lead_id.nunique().rename("리드 수")
+
+    contracted_leads = set(contracts.lead_id)
+    conv = (leads.assign(월=lead_month, 계약여부=leads.lead_id.isin(contracted_leads))
+                 .groupby("월")["계약여부"].mean() * 100).rename("전환율")
+
+    lead_dates = to_dt(leads.set_index("lead_id")["inquiry_date"])
+    c = contracts.copy()
+    c["체결월"] = to_dt(c.contract_start_date).dt.strftime("%Y-%m")
+    c["소요일"] = (to_dt(c.contract_start_date)
+                  - lead_dates.reindex(c.lead_id).values).dt.days
+    speed = c.groupby("체결월")["소요일"].median().rename("체결소요일")
+
+    pay_month = payments.payment_month.astype(str)
+    quality = (payments.assign(월=pay_month).groupby("월")["paid"]
+               .apply(lambda s: s.astype(bool).mean() * 100)).rename("납부이행률")
+
+    return pd.concat([n_leads, conv, speed, quality], axis=1).sort_index()
+
+
+# ★ 높을수록 나쁜 지표. 내 지표 이름을 넣는다.
+HIGHER_IS_WORSE = {"이탈률", "이탈율", "해지율", "불량률", "반품률", "체결소요일"}
 
 
 def status_of(name: str, value: float) -> str:
@@ -204,9 +311,7 @@ def status_of(name: str, value: float) -> str:
     th = C.THRESHOLDS.get(name)
     if not th:
         return "ok"
-    # ★ 높을수록 나쁜 지표. 내 지표 이름을 넣는다.
-    higher_is_worse = {"이탈률", "이탈율", "해지율", "불량률", "반품률"}
-    if name in higher_is_worse:
+    if name in HIGHER_IS_WORSE:
         return ("block" if value > th["위험"]
                 else "warn" if value > th["경고"] else "ok")
     return ("block" if value < th["위험"]

@@ -7,10 +7,18 @@
   Day2  지표 카드 · 획득 퍼널 · 유지 퍼널
   Day3  분해 · 실험 카드
 """
+import datetime as dt
+
 import streamlit as st
 
 from core import config as C, load, metrics as M
+from core.load import to_dt
 from viz import charts, ui
+
+
+def _month_options(dates) -> list[str]:
+    """날짜 컬럼에서 실제로 데이터가 있는 월(YYYY-MM) 목록을 뽑는다."""
+    return sorted(to_dt(dates).dropna().dt.strftime("%Y-%m").unique())
 
 st.set_page_config(page_title="대시보드", page_icon="📊", layout="wide",
                    initial_sidebar_state="expanded")
@@ -27,6 +35,8 @@ if t is None:
 
 st.markdown('<div style="font-size:24px;font-weight:800;margin-bottom:16px">'
             '대시보드</div>', unsafe_allow_html=True)
+# 확인용 — @st.fragment가 진짜 그 부분만 다시 그리는지 보려고 찍는다. 나중에 지운다.
+st.caption(f"페이지 전체 렌더링 시각: {dt.datetime.now():%H:%M:%S}")
 
 # ── 지표 카드 ─────────────────────────────────────────────────────
 k = ui.guard(M.kpis, t)
@@ -48,10 +58,61 @@ if k:
         st.caption("config.THRESHOLDS 가 비어 있어 전부 정상으로 표시됩니다. "
                    "임계값을 채우면 색이 갈립니다.")
 
-# ── 획득 퍼널 ─────────────────────────────────────────────────────
-ui.section("획득 퍼널", "그레인을 먼저 확인한다")
-f = ui.guard(M.funnel, t)
-if f is not None:
+    # st.metric 버전 (비교용). ui.kpi_card 는 위에 그대로 둔다.
+    st.caption("st.metric 버전 — 비교용")
+    LEVEL_LABEL = {"ok": "정상", "warn": "경고", "block": "위험"}
+    cols2 = st.columns(len(k))
+    for col, (name, v) in zip(cols2, k.items()):
+        with col:
+            lv = M.status_of(name, v["value"])
+            delta = None
+            if m is not None and name in getattr(m, "columns", []):
+                s = m[name].dropna()
+                if len(s) >= 2:
+                    delta = v["fmt"].format(s.iloc[-1] - s.iloc[-2])
+            st.metric(
+                label=name,
+                value=v["fmt"].format(v["value"]),
+                delta=delta,
+                delta_color="inverse" if name in M.HIGHER_IS_WORSE else "normal",
+                border=True,
+            )
+            th = C.THRESHOLDS.get(name)
+            if th:
+                st.caption(f"경고선 {v['fmt'].format(th['경고'])} / "
+                           f"현재 {LEVEL_LABEL[lv]}")
+
+# ── 획득 퍼널 / 유지 퍼널 ────────────────────────────────────────────
+@st.fragment
+def render_acquisition_funnel(t: dict) -> None:
+    # 확인용 — 이 조각만 다시 그려지는지 보려고 찍는다. 나중에 지운다.
+    st.caption(f"[획득 퍼널 조각] 렌더링 시각: {dt.datetime.now():%H:%M:%S}")
+
+    leads = t["leads"]
+    months = _month_options(leads.inquiry_date)
+    if not months:
+        st.caption("리드 데이터가 없습니다.")
+        return
+    start, end = st.select_slider(
+        "기간(문의 접수월)", options=months, value=(months[0], months[-1]),
+        key="acq_period")
+
+    lead_month = to_dt(leads.inquiry_date).dt.strftime("%Y-%m")
+    sel_leads = leads[lead_month.between(start, end)]
+    lead_ids = set(sel_leads.lead_id)
+    sel_contracts = t["contracts"][t["contracts"].lead_id.isin(lead_ids)]
+    ft = {
+        "leads": sel_leads,
+        "consultations": t["consultations"][t["consultations"].lead_id.isin(lead_ids)],
+        "visits": t["visits"][t["visits"].lead_id.isin(lead_ids)],
+        "contracts": sel_contracts,
+        "rent_payments": t["rent_payments"][
+            t["rent_payments"].contract_id.isin(set(sel_contracts.contract_id))],
+    }
+
+    f = ui.guard(M.funnel, ft)
+    if f is None:
+        return
     left, right = st.columns([1.15, 1])
     with left:
         st.plotly_chart(charts.funnel_bars(f), width="stretch",
@@ -68,11 +129,11 @@ if f is not None:
         # ★ Day3 — 분해 축. 내 데이터의 컬럼명으로 바꾼다.
         DIMS = ["device", "channel"]
         dim = st.radio("분해 축", DIMS, horizontal=True,
-                       label_visibility="collapsed")
+                       label_visibility="collapsed", key="acq_dim")
         i = st.selectbox(
             "구간", range(len(f) - 1),
             format_func=lambda i: f"{f.label.iloc[i]} → {f.label.iloc[i+1]}",
-            index=min(bi - 1, len(f) - 2))
+            index=min(bi - 1, len(f) - 2), key="acq_gap")
         g = ui.guard(M.funnel_by, t.get("funnel_events"), t.get("sessions"), dim,
                      f.step.iloc[i], f.step.iloc[i + 1])
         if g is not None and len(g):
@@ -88,13 +149,57 @@ if f is not None:
                     f"{hi[g.columns[0]]}({hi.전환율*100:.1f}%)보다 "
                     f"<b>{(hi.전환율-lo.전환율)*100:.1f}%p 낮습니다.</b>")
 
-# ── 유지 퍼널 ─────────────────────────────────────────────────────
-ui.section("유지 퍼널", "데려온 대상이 남는가")
-if not C.RETENTION_STEPS:
-    st.caption("config.RETENTION_STEPS 가 비어 있습니다. "
-               "7주차에 정한 유지·이탈의 정의를 옮기면 여기에 그려집니다.")
-rf = ui.guard(M.retention_funnel, t)
-if rf is not None and len(rf):
+    # 차트는 위에 그대로 두고, 표로도 본다.
+    disp = f[["label", "n", "step_rate", "cum_rate"]].rename(columns={
+        "label": "단계", "n": "도달 수",
+        "step_rate": "단계 전환율", "cum_rate": "누적 전환율",
+    })
+    for col in ("단계 전환율", "누적 전환율"):
+        if disp[col].max(skipna=True) is not None and disp[col].max(skipna=True) > 1:
+            disp[col] = disp[col] / 100
+    st.dataframe(
+        disp, hide_index=True, use_container_width=True,
+        column_config={
+            "단계": st.column_config.TextColumn("단계"),
+            "도달 수": st.column_config.NumberColumn("도달 수", format="%,d"),
+            "단계 전환율": st.column_config.ProgressColumn(
+                "단계 전환율", min_value=0, max_value=1, format="%.1f%%"),
+            "누적 전환율": st.column_config.ProgressColumn(
+                "누적 전환율", min_value=0, max_value=1, format="%.1f%%"),
+        },
+    )
+
+
+@st.fragment
+def render_retention_funnel(t: dict) -> None:
+    # 확인용 — 이 조각만 다시 그려지는지 보려고 찍는다. 나중에 지운다.
+    st.caption(f"[유지 퍼널 조각] 렌더링 시각: {dt.datetime.now():%H:%M:%S}")
+
+    if not C.RETENTION_STEPS:
+        st.caption("config.RETENTION_STEPS 가 비어 있습니다. "
+                   "7주차에 정한 유지·이탈의 정의를 옮기면 여기에 그려집니다.")
+        return
+
+    contracts = t["contracts"]
+    months = _month_options(contracts.contract_start_date)
+    if not months:
+        st.caption("계약 데이터가 없습니다.")
+        return
+    start, end = st.select_slider(
+        "기간(계약 체결월)", options=months, value=(months[0], months[-1]),
+        key="ret_period")
+
+    c_month = to_dt(contracts.contract_start_date).dt.strftime("%Y-%m")
+    sel_contracts = contracts[c_month.between(start, end)]
+    rt = {
+        "contracts": sel_contracts,
+        "rent_payments": t["rent_payments"][
+            t["rent_payments"].contract_id.isin(set(sel_contracts.contract_id))],
+    }
+
+    rf = ui.guard(M.retention_funnel, rt)
+    if rf is None or not len(rf):
+        return
     if "is_bottleneck" not in rf.columns:
         rf = rf.assign(is_bottleneck=False)
     c1, c2 = st.columns([1.15, 1])
@@ -108,6 +213,14 @@ if rf is not None and len(rf):
             "<b>누적값으로 비교하면 기간의 그림자를 효과로 착각합니다.</b> "
             "비율(단위 기간당)로 바꾸거나 같은 시점에 시작한 것끼리 묶으십시오.",
             "info")
+
+
+ui.section("퍼널", "그레인을 먼저 확인한다")
+tab_acq, tab_ret = st.tabs(["획득 퍼널", "유지 퍼널"])
+with tab_acq:
+    render_acquisition_funnel(t)
+with tab_ret:
+    render_retention_funnel(t)
 
 # ── 실험 ──────────────────────────────────────────────────────────
 ui.section("실험 결과", "믿을 수 있는지 먼저 보고, 그 다음에 지표를 본다")
