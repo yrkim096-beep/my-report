@@ -20,6 +20,20 @@ def _month_options(dates) -> list[str]:
     """날짜 컬럼에서 실제로 데이터가 있는 월(YYYY-MM) 목록을 뽑는다."""
     return sorted(to_dt(dates).dropna().dt.strftime("%Y-%m").unique())
 
+
+def _qp(key: str, options: list[str], fallback: str) -> str:
+    """URL 쿼리 파라미터에서 값을 읽는다. 없거나 후보에 없으면 기본값 —
+    에러를 내지 않고 조용히 떨어진다."""
+    val = st.query_params.get(key)
+    return val if val in options else fallback
+
+
+@st.dialog("이 값을 왜 보여주지 않나")
+def show_hidden_reason(condition: str, actual: str, fix: str) -> None:
+    """감춰진 카드의 근거 모달. 조건 값만 보여준다 — 지표 값·증감·p값은 넣지 않는다."""
+    st.table({"항목": ["걸린 조건", "실제 값", "믿으려면"],
+              "내용": [condition, actual, fix]})
+
 st.set_page_config(page_title="대시보드", page_icon="📊", layout="wide",
                    initial_sidebar_state="expanded")
 ui.css()
@@ -61,15 +75,13 @@ if k:
     # st.metric 버전 (비교용). ui.kpi_card 는 위에 그대로 둔다.
     st.caption("st.metric 버전 — 비교용")
     LEVEL_LABEL = {"ok": "정상", "warn": "경고", "block": "위험"}
+    deltas = ui.guard(M.kpi_deltas, t) or {}
     cols2 = st.columns(len(k))
     for col, (name, v) in zip(cols2, k.items()):
         with col:
             lv = M.status_of(name, v["value"])
-            delta = None
-            if m is not None and name in getattr(m, "columns", []):
-                s = m[name].dropna()
-                if len(s) >= 2:
-                    delta = v["fmt"].format(s.iloc[-1] - s.iloc[-2])
+            d = deltas.get(name)
+            delta = v["fmt"].format(d) if d is not None else None
             st.metric(
                 label=name,
                 value=v["fmt"].format(v["value"]),
@@ -81,21 +93,23 @@ if k:
             if th:
                 st.caption(f"경고선 {v['fmt'].format(th['경고'])} / "
                            f"현재 {LEVEL_LABEL[lv]}")
+            with st.popover("정의", width="stretch"):
+                st.write(f"**계산식**  \n{M.KPI_DEFS.get(name, '(정의 없음)')}")
+                reason = C.THRESHOLD_REASONS.get(name)
+                if reason:
+                    st.write(f"**임계값 근거**  \n{reason}")
 
 # ── 획득 퍼널 / 유지 퍼널 ────────────────────────────────────────────
 @st.fragment
-def render_acquisition_funnel(t: dict) -> None:
+def render_acquisition_funnel(t: dict, dim: str, start: str | None,
+                              end: str | None) -> None:
     # 확인용 — 이 조각만 다시 그려지는지 보려고 찍는다. 나중에 지운다.
     st.caption(f"[획득 퍼널 조각] 렌더링 시각: {dt.datetime.now():%H:%M:%S}")
 
     leads = t["leads"]
-    months = _month_options(leads.inquiry_date)
-    if not months:
+    if start is None or end is None:
         st.caption("리드 데이터가 없습니다.")
         return
-    start, end = st.select_slider(
-        "기간(문의 접수월)", options=months, value=(months[0], months[-1]),
-        key="acq_period")
 
     lead_month = to_dt(leads.inquiry_date).dt.strftime("%Y-%m")
     sel_leads = leads[lead_month.between(start, end)]
@@ -126,28 +140,50 @@ def render_acquisition_funnel(t: dict) -> None:
             f"<b>{(1-bn.step_rate)*100:.1f}%가 이탈</b>합니다.")
 
     with right:
-        # ★ Day3 — 분해 축. 내 데이터의 컬럼명으로 바꾼다.
-        DIMS = ["device", "channel"]
-        dim = st.radio("분해 축", DIMS, horizontal=True,
-                       label_visibility="collapsed", key="acq_dim")
+        # 분해 축 선택(담당자/유입채널)은 fragment 밖, 탭 위쪽으로 옮겼다 —
+        # URL과 연결된 위젯을 fragment 안에 두면 조각만 다시 그려져 URL과
+        # 화면이 어긋난다.
         i = st.selectbox(
             "구간", range(len(f) - 1),
             format_func=lambda i: f"{f.label.iloc[i]} → {f.label.iloc[i+1]}",
             index=min(bi - 1, len(f) - 2), key="acq_gap")
-        g = ui.guard(M.funnel_by, t.get("funnel_events"), t.get("sessions"), dim,
-                     f.step.iloc[i], f.step.iloc[i + 1])
+        g = ui.guard(M.funnel_by, ft, dim, f.step.iloc[i], f.step.iloc[i + 1])
         if g is not None and len(g):
             st.plotly_chart(charts.device_compare(g), width="stretch",
                             config={"displayModeBar": False})
-            hi = g.loc[g.전환율.idxmax()]
-            lo = g.loc[g.전환율.idxmin()]
-            if hi[g.columns[0]] != lo[g.columns[0]]:
-                ui.callout(
-                    f"<b>{lo[g.columns[0]]}</b>이(가) 전체의 "
-                    f"<b>{lo.비중*100:.1f}%</b>인데 전환율은 "
-                    f"<b>{lo.전환율*100:.1f}%</b>로 "
-                    f"{hi[g.columns[0]]}({hi.전환율*100:.1f}%)보다 "
-                    f"<b>{(hi.전환율-lo.전환율)*100:.1f}%p 낮습니다.</b>")
+            name_col = g.columns[0]
+            # 못 믿을 조건 분기 — config.DECOMPOSE_MIN_SAMPLE 미만인 칸은
+            # 전환율 자체가 없다(NaN). 계산해 놓고 숨기는 게 아니라 값이 없다.
+            reliable = g[g.믿음]
+            excluded = g[~g.믿음]
+            if len(reliable) >= 2:
+                hi = reliable.loc[reliable.전환율.idxmax()]
+                lo = reliable.loc[reliable.전환율.idxmin()]
+                if hi[name_col] != lo[name_col]:
+                    ui.callout(
+                        f"<b>{lo[name_col]}</b>이(가) 전체의 "
+                        f"<b>{lo.비중*100:.0f}%</b>인데 전환율은 "
+                        f"<b>{lo.표시}</b>로 "
+                        f"{hi[name_col]}({hi.표시})보다 낮습니다.")
+            elif not len(reliable):
+                st.caption(
+                    f"모든 칸이 표본 부족(config.DECOMPOSE_MIN_SAMPLE="
+                    f"{C.DECOMPOSE_MIN_SAMPLE}건 미만)이라 비교하지 않습니다. "
+                    "실제 값: " + ", ".join(
+                        f"{r[name_col]} {r.표시}" for _, r in g.iterrows()))
+            for _, r in excluded.iterrows():
+                # 색만으로 전달하지 않는다 — 배지(●▲✕○ + 글자)로 색맹도 읽게 한다.
+                bcol, ccol = st.columns([5, 1])
+                with bcol:
+                    st.markdown(ui.badge("block", f"{r[name_col]} — {r.가림사유}"),
+                               unsafe_allow_html=True)
+                with ccol:
+                    if st.button("왜 감췄나", key=f"why_{dim}_{i}_{r[name_col]}"):
+                        show_hidden_reason(
+                            condition=f"표본 부족 (config.DECOMPOSE_MIN_SAMPLE 미만)",
+                            actual=r["가림사유"],
+                            fix=f"이 칸의 도달 수가 {C.DECOMPOSE_MIN_SAMPLE}건 이상이 "
+                                "되면 전환율을 계산합니다 — 기간을 늘리거나 더 굵게 묶으십시오.")
 
     # 차트는 위에 그대로 두고, 표로도 본다.
     disp = f[["label", "n", "step_rate", "cum_rate"]].rename(columns={
@@ -171,7 +207,7 @@ def render_acquisition_funnel(t: dict) -> None:
 
 
 @st.fragment
-def render_retention_funnel(t: dict) -> None:
+def render_retention_funnel(t: dict, start: str | None, end: str | None) -> None:
     # 확인용 — 이 조각만 다시 그려지는지 보려고 찍는다. 나중에 지운다.
     st.caption(f"[유지 퍼널 조각] 렌더링 시각: {dt.datetime.now():%H:%M:%S}")
 
@@ -181,13 +217,9 @@ def render_retention_funnel(t: dict) -> None:
         return
 
     contracts = t["contracts"]
-    months = _month_options(contracts.contract_start_date)
-    if not months:
+    if start is None or end is None:
         st.caption("계약 데이터가 없습니다.")
         return
-    start, end = st.select_slider(
-        "기간(계약 체결월)", options=months, value=(months[0], months[-1]),
-        key="ret_period")
 
     c_month = to_dt(contracts.contract_start_date).dt.strftime("%Y-%m")
     sel_contracts = contracts[c_month.between(start, end)]
@@ -217,17 +249,136 @@ def render_retention_funnel(t: dict) -> None:
 
 ui.section("퍼널", "그레인을 먼저 확인한다")
 tab_acq, tab_ret = st.tabs(["획득 퍼널", "유지 퍼널"])
+
+# ── 필터 위젯은 fragment 밖에 둔다 ────────────────────────────────
+# ⚠ st.fragment 안에서 st.query_params 를 갱신하면 조각만 다시 그려져
+#   URL과 화면이 어긋난다 — 그래서 축·기간 선택은 여기, 탭 본문 위에서 한다.
+acq_months = _month_options(t["leads"].inquiry_date)
+acq_dims = list(M.DIM_SOURCE)
 with tab_acq:
-    render_acquisition_funnel(t)
+    if acq_months:
+        d_from = _qp("acq_from", acq_months, acq_months[0])
+        d_to = _qp("acq_to", acq_months, acq_months[-1])
+        acq_from, acq_to = st.select_slider(
+            "기간(문의 접수월)", options=acq_months, value=(d_from, d_to),
+            key="acq_period")
+    else:
+        acq_from = acq_to = None
+
+    d_dim = _qp("acq_dim", acq_dims, acq_dims[0])
+    acq_dim = st.segmented_control(
+        "분해 축", acq_dims, default=d_dim, required=True, key="acq_dim_ui")
+
+    st.query_params["acq_dim"] = acq_dim
+    if acq_from and acq_to:
+        st.query_params["acq_from"] = acq_from
+        st.query_params["acq_to"] = acq_to
+
+    render_acquisition_funnel(t, acq_dim, acq_from, acq_to)
+
+ret_months = _month_options(t["contracts"].contract_start_date)
 with tab_ret:
-    render_retention_funnel(t)
+    if ret_months:
+        d_from2 = _qp("ret_from", ret_months, ret_months[0])
+        d_to2 = _qp("ret_to", ret_months, ret_months[-1])
+        ret_from, ret_to = st.select_slider(
+            "기간(계약 체결월)", options=ret_months, value=(d_from2, d_to2),
+            key="ret_period")
+        st.query_params["ret_from"] = ret_from
+        st.query_params["ret_to"] = ret_to
+    else:
+        ret_from = ret_to = None
+
+    render_retention_funnel(t, ret_from, ret_to)
+
+st.caption("현재 화면 링크 (필터 상태 포함 — 복사해서 공유)")
+st.code("?" + "&".join(f"{k}={v}" for k, v in st.query_params.to_dict().items()),
+        language=None)
 
 # ── 실험 ──────────────────────────────────────────────────────────
 ui.section("실험 결과", "믿을 수 있는지 먼저 보고, 그 다음에 지표를 본다")
 res = ui.guard(M.experiment_results, t)
-if res is not None and not res:
-    st.caption("실험이 없습니다. 전후 비교로 대신하되 "
-               "**인과를 주장할 수 없다**를 카드에 남기십시오.")
+
+
+@st.fragment
+def render_before_after(t: dict) -> None:
+    """실험이 없는 도메인의 대체 카드 — 시간 기준 전후 비교.
+
+    무작위 배정이 없으므로 인과를 주장할 수 없다는 문장을 각주가 아니라
+    카드 본문에 넣는다(Day3 실습 C, "내 도메인이라면").
+    """
+    months = _month_options(t["leads"].inquiry_date)
+    if len(months) < 2:
+        st.caption("비교할 만큼 기간이 안 됩니다.")
+        return
+    split = st.select_slider(
+        "비교 기준월 (이 월부터 '이후')", options=months[1:],
+        value=months[len(months) // 2], key="ba_split")
+    ba = ui.guard(M.before_after, t, f"{split}-01")
+    if ba is None:
+        return
+
+    st.markdown(ui.badge(ba["color"], ba["판정"]), unsafe_allow_html=True)
+
+    # 판정 과정 — 접힌 채로 시작. 결과(배지)가 먼저 보이고, 펼쳐야 어디서
+    # 갈렸는지 보인다. 못 믿을 조건에 걸리면 2)·3)엔 값 대신 "계산하지 않음".
+    with st.status("판정 과정", expanded=False) as box:
+        if ba["판정"] == "판정 보류":
+            st.write(f"1) 표본 확인 — ✕ 걸림 ({ba['사유']})")
+            st.write("2) 주지표 — 계산하지 않음")
+            st.write("3) 가드레일 — 계산하지 않음")
+            box.update(label="판정 보류", state="error")
+        else:
+            st.write("1) 표본 확인 — ✓ 통과")
+            st.write(f"2) 주지표({M.BEFORE_AFTER_PRIMARY}) — "
+                     f"{ba['주지표_변화']:+.2f}%p (기준 {M.BEFORE_AFTER_MOVE}%p)")
+            if ba["판정"] == "효과 없음":
+                st.write(f"3) 가드레일 — 확인 안 함 "
+                         f"(주지표가 기준 미만이라 여기서 끝)")
+            else:
+                mark = "✕" if ba["판정"] == "주의 필요" else "✓"
+                st.write(f"3) 가드레일({M.BEFORE_AFTER_GUARD}) — {mark} "
+                         f"{ba['가드레일_변화']:+.2f}%p "
+                         f"(기준 -{M.BEFORE_AFTER_GUARD_WORSEN}%p)")
+            box.update(label=ba["판정"], state="complete")
+
+    if ba["판정"] == "판정 보류":
+        # 못 믿을 조건 — 계산은 했지만 값을 보여주지 않는다. 사유만 남긴다.
+        st.caption(f"표본 부족: {ba['사유']} — 지표 값을 표시하지 않습니다.")
+        if st.button("왜 감췄나", key="why_ba"):
+            show_hidden_reason(
+                condition="표본 부족 (config.DECOMPOSE_MIN_SAMPLE 미만)",
+                actual=ba["사유"],
+                fix=f"이전·이후 두 구간 모두 {C.DECOMPOSE_MIN_SAMPLE}건 이상이 되도록 "
+                    "기준월을 데이터 양끝에서 떨어뜨려 고르십시오.")
+        return
+
+    prev, cur = ba["이전"], ba["이후"]
+    cols = st.columns(len(prev))
+    for col, name in zip(cols, prev):
+        with col:
+            st.metric(
+                label=name,
+                value=cur[name]["fmt"].format(cur[name]["value"]),
+                delta=cur[name]["fmt"].format(
+                    cur[name]["value"] - prev[name]["value"]),
+                delta_color="inverse" if name in M.HIGHER_IS_WORSE else "normal",
+                border=True,
+            )
+    st.caption(
+        f"이전 {ba['n_이전']:,}건 (~{split} 이전) · 이후 {ba['n_이후']:,}건 ({split}~) · "
+        f"주지표({M.BEFORE_AFTER_PRIMARY}) 변화 {ba['주지표_변화']:+.2f}%p "
+        f"(기준 {M.BEFORE_AFTER_MOVE}%p) · "
+        f"가드레일({M.BEFORE_AFTER_GUARD}) 변화 {ba['가드레일_변화']:+.2f}%p "
+        f"(기준 -{M.BEFORE_AFTER_GUARD_WORSEN}%p)")
+    ui.callout(
+        "<b>이 비교는 인과를 주장할 수 없습니다.</b> "
+        "무작위 배정이 없었으므로 다른 요인의 영향을 배제하지 못합니다.")
+
+
+if not res:
+    render_before_after(t)
+
 for r in (res or []):
     cls = r["color"]
     head = (f'<div class="exp {cls}">'

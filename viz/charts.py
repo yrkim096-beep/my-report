@@ -52,20 +52,32 @@ def funnel_bars(f):
 
 
 def device_compare(g):
-    """기기별 전환율 비교. 격차가 보이는 것이 목적이다."""
+    """분해 축별 전환율 비교. 격차가 보이는 것이 목적이다.
+
+    g.믿음 이 False 인 칸(표본이 config.DECOMPOSE_MIN_SAMPLE 미만)은 전환율
+    자체가 NaN이다 — 계산해 놓고 숨기는 게 아니라 값이 없다. 그런 칸은 막대
+    길이를 0으로 두고 **block(빨강)** 으로 표시한다 — 판단기준 ⑤: "못 믿을
+    조건에 걸린 카드는 block. 표본 부족이든 뭐든 결론이 '이 값을 쓰면 안 됨'
+    으로 같기 때문". 믿을 수 있는 칸 중 가장 낮은 것은 warn(주황) — 이건
+    "못 믿음"이 아니라 "실제로 낮으니 사람이 봐야 함"이라 다른 색을 쓴다.
+    라벨은 항상 g.표시(믿을 수 있으면 비율, 아니면 가림사유)를 쓴다.
+    """
     g = g.sort_values("전환율")
-    colors = [C.COLORS["block"] if r.전환율 == g.전환율.min() else C.BRAND["primary"]
-              for _, r in g.iterrows()]
+    min_reliable = g.loc[g.믿음, "전환율"].min() if g.믿음.any() else None
+    colors = [
+        C.COLORS["block"] if not rel else
+        (C.COLORS["warn"] if rate == min_reliable else C.BRAND["primary"])
+        for rel, rate in zip(g.믿음, g.전환율)
+    ]
     fig = go.Figure(go.Bar(
-        x=g.전환율 * 100, y=g[g.columns[0]], orientation="h",
+        x=g.전환율.fillna(0) * 100, y=g[g.columns[0]], orientation="h",
         marker=dict(color=colors, line=dict(width=0)),
-        text=[f"{v*100:.1f}%  ({n:,}명 중 {c:,}명)"
-              for v, n, c in zip(g.전환율, g.도달, g.전환)],
+        text=g["표시"],
         textposition="outside", textfont=dict(size=12, color=C.BRAND["muted"]),
-        hovertemplate="%{y}<br>%{x:.1f}%<extra></extra>",
+        hovertemplate="%{y}<br>%{text}<extra></extra>",
     ))
     fig.update_yaxes(showgrid=False, tickfont=dict(size=13))
-    fig.update_xaxes(visible=False, range=[0, g.전환율.max() * 155])
+    fig.update_xaxes(visible=False, range=[0, g.전환율.max(skipna=True) * 175])
     return _base(fig, height=52 * len(g) + 40,
                  margin=dict(l=8, r=8, t=4, b=4))
 

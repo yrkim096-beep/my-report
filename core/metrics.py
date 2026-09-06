@@ -28,6 +28,25 @@ from core.todo import todo
 
 
 # ── 퍼널 ──────────────────────────────────────────────────────────
+def _stage_leads(t: dict) -> dict[str, set]:
+    """단계별 "도달한 lead_id 집합". funnel() 과 funnel_by() 가 함께 쓴다."""
+    leads, consultations = t["leads"], t["consultations"]
+    visits, contracts, payments = t["visits"], t["contracts"], t["rent_payments"]
+
+    contract_lead = contracts.set_index("contract_id")["lead_id"]
+    paid_contract_ids = set(payments.loc[payments.paid.astype(bool), "contract_id"])
+    paid_leads = set(contract_lead.reindex(list(paid_contract_ids)).dropna())
+
+    return {
+        "문의접수": set(leads.lead_id),
+        "상담진행": set(consultations.lead_id),
+        "방문예약진행": set(visits.lead_id),
+        "계약체결": set(contracts.lead_id),
+        "입주": set(contracts.lead_id),  # contract_start_date = 입주일(알려진 한계, 위 참고)
+        "첫월세납부": paid_leads,
+    }
+
+
 @st.cache_data(show_spinner=False)
 def funnel(t: dict) -> pd.DataFrame:
     """단계별 도달 인원과 전환율.
@@ -56,21 +75,7 @@ def funnel(t: dict) -> pd.DataFrame:
         drop           전 단계에서 빠진 수
         is_bottleneck  step_rate 가 가장 낮은 구간이면 True
     """
-    leads, consultations = t["leads"], t["consultations"]
-    visits, contracts, payments = t["visits"], t["contracts"], t["rent_payments"]
-
-    contract_lead = contracts.set_index("contract_id")["lead_id"]
-    paid_contract_ids = set(payments.loc[payments.paid.astype(bool), "contract_id"])
-    paid_leads = set(contract_lead.reindex(list(paid_contract_ids)).dropna())
-
-    stage_leads = {
-        "문의접수": set(leads.lead_id),
-        "상담진행": set(consultations.lead_id),
-        "방문예약진행": set(visits.lead_id),
-        "계약체결": set(contracts.lead_id),
-        "입주": set(contracts.lead_id),  # contract_start_date = 입주일(알려진 한계, 위 참고)
-        "첫월세납부": paid_leads,
-    }
+    stage_leads = _stage_leads(t)
 
     rows = []
     prev_n = first_n = None
@@ -93,24 +98,99 @@ def funnel(t: dict) -> pd.DataFrame:
     return df
 
 
+# ★ 분해 축. 어느 테이블의 어느 컬럼인지. 담당자·유입채널 둘 다 손을 쓸 수 있는
+#   축으로 골랐다(Day3 실습 A) — 매물유형은 격차가 2.2%p뿐이라 뺐다.
+DIM_SOURCE = {
+    "담당자": ("consultations", "counselor_id"),
+    "유입채널": ("leads", "channel"),
+}
+
+
+def sample_band(n: int) -> str:
+    """건수 구간. 「적은 표본으로 판단하기」의 표를 그대로 코드로 옮긴다.
+
+    한 칸을 감출지 말지를 임계값 하나로 이분하지 않는다 — 건수 구간마다
+    "무엇을 보여줄 수 있는가"가 다르다(전수만 · 경향만 · 정수 비율만 · 소수점
+    비율 · 전부). 평균이 아니라 **그 칸 자체의 건수**로 판정한다.
+    """
+    if n < 10:
+        return "전수"
+    if n < 30:
+        return "경향"
+    if n < 100:
+        return "정수율"
+    if n < 500:
+        return "비율"
+    return "충분"
+
+
+def format_cell(n: int, m: int) -> str:
+    """건수 구간에 맞는 표시 문자열. 분모(n)를 반드시 같이 적는다.
+
+        전수    비율을 아예 안 쓴다 — "3건 중 1건"
+        경향    비율은 10% 단위까지만 — 소수점을 쓰면 없는 정밀도를 지어낸 것
+        정수율  비율은 정수 자리까지만
+        비율    소수점 한 자리까지
+        충분    소수점 한 자리, 천단위 구분
+    """
+    band = sample_band(n)
+    if band == "전수":
+        return f"{n}건 중 {m}건"
+    if band == "경향":
+        return f"{n}건 중 {m}건 (약 {round(m / n * 100 / 10) * 10}%)"
+    if band == "정수율":
+        return f"{m / n * 100:.0f}% ({n}건 중 {m}건)"
+    if band == "비율":
+        return f"{m / n * 100:.1f}% ({n}건 중 {m}건)"
+    return f"{m / n * 100:.1f}% ({n:,}건 중 {m:,}건)"
+
+
 @st.cache_data(show_spinner=False)
-def funnel_by(fe: pd.DataFrame, se: pd.DataFrame, dim: str,
-              step_from: str, step_to: str) -> pd.DataFrame:
+def funnel_by(t: dict, dim: str, step_from: str, step_to: str) -> pd.DataFrame:
     """차원별 특정 구간 전환율. 평균 하나로는 어디를 고칠지 모른다.
 
-    ★ Day3 실습 B에서 채웁니다.
-
-    dim 은 분해 축이다. **무엇으로 쪼갤지는 내가 정한다.**
-    기기·채널·지역·요금제·담당자·유입경로 — 도메인마다 다르다.
-
+    dim 은 분해 축이다. DIM_SOURCE 에 등록된 이름만 받는다.
     쪼개는 기준은 이것이다: 그 축으로 나눴을 때 **손을 쓸 수 있는가.**
     나눠서 격차가 보여도 우리가 못 바꾸는 것이면 분해할 이유가 적다.
 
-    반환: DataFrame[<dim>, 도달, 전환, 전환율, 비중]
+    반환: DataFrame[<dim>, 도달, 전환, 전환율, 비중, band, 표시, 믿음, 가림사유]
+
+        도달     step_from 에 도달한 lead 수 (그 칸)
+        전환     그중 step_to 까지 넘어간 lead 수
+        전환율   전환 / 도달 (0~1). **믿음이 False 인 칸은 NaN 이다** —
+                 계산해 놓고 안 보여주는 게 아니라, 표시할 값 자체가 없다
+        비중     도달 / step_from 전체 도달 수 (0~1)
+        band     sample_band(도달) — 참고용 세부 구간
+        믿음     도달 >= config.DECOMPOSE_MIN_SAMPLE (못 믿을 조건 분기)
+        가림사유  믿음이 False 일 때만 채워진다. 실제 숫자를 담는다
+        표시     믿음이면 format_cell(도달, 전환), 아니면 가림사유
     """
-    todo("Day3 실습 B", "분해",
-         "무엇으로 쪼갤지 정하십시오. 쪼개서 격차가 보이면 손을 쓸 수 있습니까?",
-         "core/metrics.py  funnel_by()")
+    stage = _stage_leads(t)
+    reach_from, reach_to = stage[step_from], stage[step_to]
+    table_name, col = DIM_SOURCE[dim]
+
+    src = t[table_name][["lead_id", col]].drop_duplicates("lead_id")
+    df = pd.DataFrame({"lead_id": list(reach_from)}).merge(src, on="lead_id", how="left")
+    df[col] = df[col].astype(object).fillna("결측")
+    df["전환됨"] = df.lead_id.isin(reach_to)
+
+    g = df.groupby(col, dropna=False)["전환됨"].agg(전환="sum", 도달="count").reset_index()
+    g["비중"] = g["도달"] / g["도달"].sum()
+    g["band"] = g["도달"].apply(sample_band)
+
+    # ★ 못 믿을 조건 분기 — 표본이 config.DECOMPOSE_MIN_SAMPLE 미만이면
+    # 전환율 자체를 계산하지 않는다(NaN). 사유에는 실제 숫자를 넣는다.
+    g["믿음"] = g["도달"] >= C.DECOMPOSE_MIN_SAMPLE
+    g["가림사유"] = g["도달"].apply(
+        lambda n: None if n >= C.DECOMPOSE_MIN_SAMPLE
+        else f"표본 {n}건 (최소 {C.DECOMPOSE_MIN_SAMPLE}건)")
+    g["전환율"] = np.where(g["믿음"], g["전환"] / g["도달"], np.nan)
+    g["표시"] = [
+        format_cell(n, m) if 믿음 else 사유
+        for 믿음, 사유, n, m in zip(g["믿음"], g["가림사유"], g["도달"], g["전환"])
+    ]
+    return g.rename(columns={col: dim})[
+        [dim, "도달", "전환", "전환율", "비중", "band", "믿음", "가림사유", "표시"]]
 
 
 # ── 유지 퍼널 ─────────────────────────────────────────────────────
@@ -227,6 +307,16 @@ def churn(t: dict) -> dict:
 
 
 # ── KPI ───────────────────────────────────────────────────────────
+# ★ kpis() 각 지표의 계산식을 사람이 읽는 문장으로도 남긴다. 화면의
+#   st.popover("정의")가 여기서 읽어 보여준다. 임계값 근거는 config.THRESHOLD_REASONS.
+KPI_DEFS: dict[str, str] = {
+    "리드 수": "leads 테이블 전체 행 수 (lead_id 고유값 개수)",
+    "전환율": "계약까지 간 리드 수 ÷ 전체 리드 수 × 100",
+    "체결소요일": "문의 접수일 ~ 계약 체결일 사이 일수의 중앙값",
+    "납부이행률": "정상 납부(rent_payments.paid == True) 건수 ÷ 전체 납부 건수 × 100",
+}
+
+
 @st.cache_data(show_spinner=False)
 def kpis(t: dict) -> dict:
     """지표 카드. 규모·전환·속도·품질 네 축에서 하나씩 뽑았다.
@@ -257,6 +347,94 @@ def kpis(t: dict) -> dict:
                     "unit": "일", "fmt": "{:.1f}일"},
         "납부이행률": {"value": float(payments.paid.astype(bool).mean() * 100),
                     "unit": "%", "fmt": "{:.2f}%"},
+    }
+
+
+# ★ 전후 비교의 주지표·가드레일과 판정 기준. 실험이 없어 이 표로 대신한다.
+#   근거 — 여러 시점으로 실제 전후 비교를 반복해 본 결과(과거 데이터 안에서
+#   기준월을 이동시켜 가며 관측), 관측 편향이 없는 구간에서도 두 값 다
+#   최대 ±2.8%p 안에서 자연스럽게 흔들렸다. 그 흔들림보다 뚜렷이 크도록
+#   3%p를 기준으로 잡았다.
+BEFORE_AFTER_PRIMARY = "전환율"       # 주지표 — 이 퍼널의 핵심 전환 지표
+BEFORE_AFTER_MOVE = 3.0              # %p. 이보다 작으면 "효과 없음"
+BEFORE_AFTER_GUARD = "납부이행률"     # 가드레일 — 계약을 서둘러 늘리면 질이 떨어질 수 있다
+BEFORE_AFTER_GUARD_WORSEN = 3.0      # %p. 이보다 나빠지면 "주의 필요"
+
+
+@st.cache_data(show_spinner=False)
+def before_after(t: dict, split: str) -> dict:
+    """전후 비교. split(YYYY-MM-DD) 이전/이후로 나눠 kpis() 를 각각 낸다.
+
+    ★ 이 도메인엔 실험(A/B)이 없다. 무작위 배정 없이 시간으로만 가른
+    비교라 **인과를 주장할 수 없다** — 이건 계산이 아니라 화면 카드에
+    적어야 하는 문장이다(Day3 실습 C, "내 도메인이라면").
+
+    그레인은 문의(lead) 기준이다 — inquiry_date 가 split 이전/이후인
+    리드로 나누고, 그 리드에 딸린 하위 테이블만 같이 잘라 kpis() 에 넣는다.
+
+    판정 순서(★ 순서가 중요하다 — 못 믿을 조건이 먼저다. 1번을 통과했다고
+    바로 성공으로 가지 않는다):
+
+        0. 이전·이후 중 표본이 config.DECOMPOSE_MIN_SAMPLE 미만인 쪽이
+           있는가 — 있으면 "판정 보류"(계산은 했지만 결론은 안 낸다)
+        1. 주지표(BEFORE_AFTER_PRIMARY)가 BEFORE_AFTER_MOVE 이상 움직였는가
+           — 아니면 "효과 없음"
+        2. 가드레일(BEFORE_AFTER_GUARD)이 BEFORE_AFTER_GUARD_WORSEN 이상
+           나빠졌는가 — 그러면 "주의 필요"
+        3. 둘 다 통과 — "성공"
+
+    반환: {"split": str, "이전": kpis dict, "이후": kpis dict,
+           "n_이전": int, "n_이후": int,
+           "주지표_변화": float, "가드레일_변화": float,
+           "판정": str, "color": str, "사유": str | None}
+    """
+    leads = t["leads"]
+    lead_date = to_dt(leads.inquiry_date)
+    split_ts = pd.Timestamp(split)
+
+    def _subset(mask: pd.Series) -> dict:
+        sel_leads = leads[mask]
+        lead_ids = set(sel_leads.lead_id)
+        sel_contracts = t["contracts"][t["contracts"].lead_id.isin(lead_ids)]
+        return {
+            "leads": sel_leads,
+            "consultations": t["consultations"][
+                t["consultations"].lead_id.isin(lead_ids)],
+            "visits": t["visits"][t["visits"].lead_id.isin(lead_ids)],
+            "contracts": sel_contracts,
+            "rent_payments": t["rent_payments"][
+                t["rent_payments"].contract_id.isin(set(sel_contracts.contract_id))],
+        }
+
+    before, after = _subset(lead_date < split_ts), _subset(lead_date >= split_ts)
+    n_before, n_after = len(before["leads"]), len(after["leads"])
+    kb, ka = kpis(before), kpis(after)
+
+    primary_move = ka[BEFORE_AFTER_PRIMARY]["value"] - kb[BEFORE_AFTER_PRIMARY]["value"]
+    guard_move = ka[BEFORE_AFTER_GUARD]["value"] - kb[BEFORE_AFTER_GUARD]["value"]
+
+    # 0) 못 믿을 조건이 먼저다 — 표본이 모자라면 움직임 크기와 무관하게 보류.
+    if n_before < C.DECOMPOSE_MIN_SAMPLE or n_after < C.DECOMPOSE_MIN_SAMPLE:
+        small = "이전" if n_before < n_after else "이후"
+        n_small = min(n_before, n_after)
+        verdict, color = "판정 보류", "block"
+        reason = f"{small} 표본 {n_small}건 (최소 {C.DECOMPOSE_MIN_SAMPLE}건)"
+    # 1) 주지표가 안 움직였으면 여기서 끝 — 가드레일은 볼 필요도 없다.
+    elif abs(primary_move) < BEFORE_AFTER_MOVE:
+        verdict, color, reason = "효과 없음", "none", None
+    # 2) 움직였다. 그런데 가드레일이 나빠졌으면 "주의 필요" — 성공이 아니다.
+    elif guard_move <= -BEFORE_AFTER_GUARD_WORSEN:
+        verdict, color, reason = "주의 필요", "warn", None
+    # 3) 둘 다 통과.
+    else:
+        verdict, color, reason = "성공", "ok", None
+
+    return {
+        "split": split,
+        "이전": kb, "이후": ka,
+        "n_이전": n_before, "n_이후": n_after,
+        "주지표_변화": primary_move, "가드레일_변화": guard_move,
+        "판정": verdict, "color": color, "사유": reason,
     }
 
 
@@ -296,6 +474,34 @@ def monthly(t: dict) -> pd.DataFrame:
                .apply(lambda s: s.astype(bool).mean() * 100)).rename("납부이행률")
 
     return pd.concat([n_leads, conv, speed, quality], axis=1).sort_index()
+
+
+@st.cache_data(show_spinner=False)
+def kpi_deltas(t: dict) -> dict[str, float | None]:
+    """kpis() 각 지표의 "직전 달 대비" 변화량.
+
+    monthly() 열에서 결측을 뺀 마지막 두 값의 차이다 — 대시보드 카드와
+    리포트 요약이 서로 다른 계산을 쓰면 숫자가 어긋난다. 이 함수 하나로
+    통일해서 둘 다 여기서 값을 가져오게 한다.
+
+    ★ config.PERIOD 종료월 이후는 자른다. rent_payments 는 계약 기간(최대
+    12개월)만큼 리드 관측 기간보다 더 뒤까지 남아 있어서, 자르지 않으면
+    납부이행률만 다른(더 늦은) 달을 "직전 달"로 잡아 다른 지표와 다른
+    시점을 비교하게 된다 — 실제로 표본 1건짜리 꼬리 달과 비교돼 변화량이
+    +100%p 처럼 튄 적이 있다. 네 지표를 같은 마지막 달(PERIOD 종료월)에
+    맞춰야 서로 비교가 된다.
+
+    반환: {"지표이름": 변화량} — 추이가 2개월 미만이면 None.
+    """
+    m = monthly(t).loc[:C.PERIOD[1][:7]]
+    out: dict[str, float | None] = {}
+    for name in kpis(t):
+        if name not in m.columns:
+            out[name] = None
+            continue
+        s = m[name].dropna()
+        out[name] = float(s.iloc[-1] - s.iloc[-2]) if len(s) >= 2 else None
+    return out
 
 
 # ★ 높을수록 나쁜 지표. 내 지표 이름을 넣는다.
@@ -370,21 +576,10 @@ def srm_check(asg: pd.DataFrame, exp_id: str) -> dict:
 def trust_check(srm: dict, n_total: int, days: int | None = None) -> str | None:
     """이 실험을 믿을 수 있는가. **계산하기 전에** 묻는다.
 
-    ★ Day3 실습 C에서 채웁니다. ← 오늘의 핵심
-
-    ────────────────────────────────────────────────────────────
-    오늘의 어려운 일은 계산이 아니다.
-    **계산은 이미 할 수 있는데, 화면에 안 그리는 코드를 쓰는 것**이다.
-    ────────────────────────────────────────────────────────────
-
-    못 믿을 조건은 셋인데 **분기는 하나**다.
-
-        배정이 깨졌다      srm["ok"] 가 False
-                          → 어떤 효과가 나와도 해석할 수 없다
-        표본이 모자란다    n_total 이 config.MIN_SAMPLE 미만
-                          → 계산해도 못 믿는다. 내 데이터는 대개 여기 걸린다
-        기간이 안 찼다     days 가 최소 기간 미만
-                          → 초기 효과가 남아 있다
+    못 믿을 조건은 하나다 — **표본이 config.DECOMPOSE_MIN_SAMPLE 미만.**
+    이 도메인엔 실험(A/B)이 없어 배정 공정성(srm)·최소 기간(days)은
+    해당 없음으로 둔다 — 조건이 하나뿐이어도 된다, 억지로 셋을 채우지 않는다.
+    (funnel_by() 의 분해 칸을 가리는 기준과 같은 값을 쓴다 — 근거를 하나로 유지)
 
     하나라도 걸리면 **사유 문자열**을 돌려준다. 돌려주면
     experiment_results() 가 거기서 멈추고 **지표를 계산하지 않는다.**
@@ -395,12 +590,14 @@ def trust_check(srm: dict, n_total: int, days: int | None = None) -> str | None:
         안 됩니다. **사람은 본 숫자를 기억합니다.**
         옆에 아무리 경고를 붙여도 회의실에서 인용되는 것은 숫자입니다.
 
+    ★ 사유에는 실제 숫자를 넣는다. "표본 부족"이 아니라
+      "표본 12건 (최소 50건)"처럼 — 두루뭉술하면 사람이 판단할 수 없다.
+
     반환: 못 믿을 이유(str) 또는 None
     """
-    todo("Day3 실습 C", "못 믿을 조건 분기",
-         "배정·표본·기간 셋 중 하나라도 걸리면 사유를 돌려주십시오. "
-         "돌려주면 지표를 계산하지 않습니다.",
-         "core/metrics.py  trust_check()")
+    if n_total < C.DECOMPOSE_MIN_SAMPLE:
+        return f"표본 {n_total}건 (최소 {C.DECOMPOSE_MIN_SAMPLE}건)"
+    return None
 
 
 @st.cache_data(show_spinner=False)
