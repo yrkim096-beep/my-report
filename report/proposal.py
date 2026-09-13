@@ -27,18 +27,23 @@
 """
 from __future__ import annotations
 
+import io
 import re
 from pathlib import Path
 
 from core import config as C, metrics as M
 from report.sections import check_phrasing  # ★ 새로 만들지 않고 재사용한다
+from report.to_pdf import Report as _PdfReport, INK as _INK, MUTED as _MUTED, LINE as _LINE
+from viz import pdf_charts as PDFC
 from viz import proposal_charts as PC
 
 DEFAULT_CARDS_PATH = C.ROOT / "day2" / "제안카드.md"
 
 _CLS_ORDER = ["하지 말 것", "다시 할 것", "할 것"]
 _CLS_TAG = {"하지 말 것": "stop", "다시 할 것": "redo", "할 것": "go"}
-_CLS_MARK = {"하지 말 것": "✕", "다시 할 것": "▲", "할 것": "●"}
+# ★ ✕·▲·● 는 Noto Sans KR 폰트에 글자가 없어 PDF에서 네모(두부)로 깨진다 —
+#   HTML과 PDF 둘 다에서 쓰는 표시라 폰트가 확실히 지원하는 문자만 쓴다.
+_CLS_MARK = {"하지 말 것": "[X]", "다시 할 것": "[R]", "할 것": "[O]"}
 
 
 # ── 카드 파일 파싱 (Day2에서 그대로 가져온다) ─────────────────────
@@ -311,3 +316,93 @@ def to_html(secs: list[dict], meta: dict) -> str:
 </div>
 </body>
 </html>'''
+
+
+# ── PDF 내보내기 ──────────────────────────────────────────────────
+_ORDER = [
+    "한 장 요약", "1. 지금 어디서 새고 있습니까", "2. 어느 지점에서 벌어집니까",
+    "3. 얼마짜리 문제입니까", "4. 무엇을 하자는 것입니까",
+    "5. 이 판단이 틀릴 수 있는 지점", "6. 무엇을 결정해 주셔야 합니까",
+]
+
+
+def build_pdf(secs: list[dict], evidence: dict, topic: dict, meta: dict) -> bytes:
+    """제안서를 PDF(A4)로 만든다. 차트는 report/to_pdf.py 와 같은 폰트·여백을 쓰는
+    report.to_pdf.Report 클래스를 그대로 재사용한다 — 새 PDF 틀을 만들지 않는다.
+    화면(SVG)과 다르게 PDF는 fpdf2가 SVG를 못 그려서 matplotlib PNG로 바꾼다
+    (viz/pdf_charts.py — 리포트 PDF가 이미 쓰는 것을 그대로 재사용한다).
+    """
+    pdf = _PdfReport()
+
+    # ── 표지 ──────────────────────────────────────────────────────
+    pdf.add_page()
+    pdf.ln(60)
+    pdf.set_font(pdf.base, "B", 24)
+    pdf.set_text_color(*_INK)
+    pdf.multi_cell(0, 11, meta.get("title", "성과 개선 제안"))
+    pdf.ln(3)
+    pdf.set_font(pdf.base, "", 11)
+    pdf.set_text_color(*_MUTED)
+    pdf.cell(0, 7, f"데이터셋 {meta.get('dataset', '')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"기간 {meta.get('period', '')}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"작성 {meta.get('date', '')}", new_x="LMARGIN", new_y="NEXT")
+
+    by_title = {s["title"]: s for s in secs}
+    for title in _ORDER:
+        s = by_title[title]
+        pdf.add_page()
+        pdf.set_font(pdf.base, "B", 15)
+        pdf.set_text_color(*_INK)
+        pdf.multi_cell(0, 9, title)
+        pdf.ln(1)
+        pdf.set_draw_color(*_LINE)
+        pdf.set_line_width(0.3)
+        pdf.line(pdf.l_margin, pdf.get_y(), pdf.w - pdf.r_margin, pdf.get_y())
+        pdf.ln(6)
+
+        if title == "6. 무엇을 결정해 주셔야 합니까":
+            pdf.set_font(pdf.base, "", 10.5)
+            pdf.set_text_color(*_INK)
+            for ln in s.get("auto_lines", []):
+                # ★ multi_cell 기본값(new_x="RIGHT")은 커서를 셀 오른쪽 끝에 남긴다.
+                # 다음 줄을 그대로 이어 부르면 남은 폭이 0에 가까워 fpdf2가
+                # "한 글자 그릴 공간도 없다" 예외를 던진다 — 매번 왼쪽 여백으로 되돌린다.
+                pdf.multi_cell(0, 6.2, f"- {ln}", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+
+        body = (s.get("body") or "").strip()
+        if not body:
+            pdf.set_font(pdf.base, "", 10)
+            pdf.set_text_color(*_MUTED)
+            pdf.multi_cell(0, 6, f"[작성되지 않음] {s.get('placeholder', '')}")
+        else:
+            pdf.set_font(pdf.base, "", 10.5)
+            pdf.set_text_color(*_INK)
+            for para in body.split("\n\n"):
+                pdf.multi_cell(0, 6.2, para.strip())
+                pdf.ln(3)
+
+        png = None
+        if title == "1. 지금 어디서 새고 있습니까":
+            png = PDFC.funnel_png(evidence["현황"])
+        elif title == "2. 어느 지점에서 벌어집니까" and evidence.get("원인") is not None:
+            trusted = evidence["원인"][evidence["원인"].믿음]
+            if len(trusted):
+                png = PDFC.device_png(trusted)
+        elif title == "3. 얼마짜리 문제입니까":
+            trend_col = None
+            if topic["키"].startswith("threshold_"):
+                trend_col = topic["키"].split("threshold_", 1)[1]
+            elif topic["키"].startswith("trend_"):
+                trend_col = topic["키"].split("trend_", 1)[1]
+            trend = evidence.get("추세")
+            if trend_col and trend is not None and trend_col in trend.columns:
+                png = PDFC.trend_png(trend, trend_col, title=trend_col)
+        if png:
+            if pdf.get_y() > 190:
+                pdf.add_page()
+            pdf.ln(2)
+            pdf.image(io.BytesIO(png), w=pdf.w - pdf.l_margin - pdf.r_margin)
+
+    out = pdf.output()
+    return bytes(out)
