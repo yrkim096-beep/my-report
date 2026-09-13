@@ -754,3 +754,165 @@ def channel_efficiency(t: dict) -> pd.DataFrame:
     todo("Day3 선택 과제", "채널 효율",
          "내 도메인에 획득 경로 구분이 있습니까? 비용이 없으면 투입 공수로 바꾸십시오.",
          "core/metrics.py  channel_efficiency()")
+
+
+# ── 제안서 주제 후보 (9주차 Day3) ──────────────────────────────────
+def _annual(n: float) -> float:
+    """관측 기간(config.PERIOD) 동안의 건수를 연간으로 환산한다."""
+    days = (pd.Timestamp(C.PERIOD[1]) - pd.Timestamp(C.PERIOD[0])).days
+    months = days / 30.44
+    return n / months * 12
+
+
+@st.cache_data(show_spinner=False)
+def proposal_topics(t: dict) -> list[dict]:
+    """제안서 주제 후보를 가능한 만큼 뽑는다. 하나만 고르지 않는다.
+
+    ★ Day3 실습 A. 후보를 만드는 곳 넷:
+
+        ① 퍼널 구간   단계 전환율이 가장 낮은 구간과 그다음으로 낮은 구간의 격차
+        ② 분해 축     DIM_SOURCE 각 축에서 최고 칸과 최저 칸의 전환율 격차(병목 구간)
+        ③ 임계값      config.THRESHOLDS 를 벗어난 지표
+        ④ 추세        최근 3개월 평균이 직전 3개월보다 나쁜 지표
+
+    **격차가 작아 기각된 후보도 목록에 남긴다.** 지우지 않고 기각사유만 채운다.
+    **못 믿을 조건(표본 미달)에 걸린 칸은 애초에 후보로 만들지 않는다** — 그건
+    "차이가 작다"가 아니라 "비교 자체가 안 된다"라서 기각과 다르다.
+
+    반환: [{"키","제목","한줄","규모_연간건수","근거축","구간","기각사유"}]
+    규모가 큰 채택 후보가 먼저, 기각된 것은 맨 뒤로 간다.
+    """
+    f = funnel(t)
+    rates = f[f.step_rate.notna()].sort_values("step_rate")
+    topics: list[dict] = []
+
+    # ① 퍼널 구간 — 가장 낮은 구간과 그다음으로 낮은 구간의 격차.
+    #   이 격차 자체는 "어느 축을 손봐야 할지"를 알려주지 않으므로 기각한다 —
+    #   ②(분해 축)가 그 답을 갖고 있다.
+    if len(rates) >= 2:
+        worst, second = rates.iloc[0], rates.iloc[1]
+        bi = int(f.index[f.step == worst.step][0])
+        topics.append({
+            "키": "funnel_gap", "제목": "퍼널 병목 구간 정체",
+            "한줄": (f"{worst.label}({worst.step_rate*100:.1f}%)이 그다음으로 낮은 "
+                    f"{second.label}({second.step_rate*100:.1f}%)보다 "
+                    f"{(second.step_rate-worst.step_rate)*100:.1f}%p 낮다"),
+            "규모_연간건수": round(_annual(f.n.iloc[bi]), 1),
+            "근거축": None, "구간": (f.step.iloc[bi-1], worst.step) if bi > 0 else None,
+            "기각사유": "구간 자체만으로는 무엇을 손볼지 특정할 수 없다 — 분해 축으로 좁혀야 한다",
+        })
+
+    # ② 분해 축 — 병목 구간을 축별로 쪼갠 최고-최저 격차.
+    bn = f[f.is_bottleneck].iloc[0]
+    bi = max(int(f.index[f.label == bn.label][0]), 1)
+    prev_step, gap_step = f.step.iloc[bi - 1], f.step.iloc[bi]
+    for dim in DIM_SOURCE:
+        g = funnel_by(t, dim, prev_step, gap_step)
+        trusted = g[g.믿음]
+        if len(trusted) < 2:
+            continue
+        top = trusted.loc[trusted.전환율.idxmax()]
+        bot = trusted.loc[trusted.전환율.idxmin()]
+        gap = top.전환율 - bot.전환율
+        extra = bot.도달 * gap  # 하위 칸이 상위 칸 수준이었다면 늘었을 전환(관측 기간 전체)
+        topics.append({
+            "키": f"dim_{dim}", "제목": f"{dim}별 전환율 격차",
+            "한줄": (f"{dim} {bot[dim]}({bot.전환율*100:.1f}%) vs "
+                    f"{top[dim]}({top.전환율*100:.1f}%), 격차 {gap*100:.1f}%p"),
+            "규모_연간건수": round(_annual(extra), 1),
+            "근거축": dim, "구간": (prev_step, gap_step), "기각사유": None,
+        })
+
+    # ③ 임계값 — config.THRESHOLDS 를 벗어난 지표.
+    k = kpis(t)
+    for name, v in k.items():
+        if status_of(name, v["value"]) in ("warn", "block"):
+            th = C.THRESHOLDS[name]
+            topics.append({
+                "키": f"threshold_{name}", "제목": f"{name} 임계값 초과",
+                "한줄": (f"{name} {v['fmt'].format(v['value'])} — 경고 기준"
+                        f"({th['경고']}) 초과"
+                        + (f", 위험 기준({th['위험']}) 근접" if name in HIGHER_IS_WORSE
+                           and v["value"] > th["위험"] * 0.9 else "")),
+                "규모_연간건수": round(_annual(t["contracts"].contract_id.nunique()), 1),
+                "근거축": None, "구간": None, "기각사유": None,
+            })
+
+    # ④ 추세 — 최근 3개월 평균이 직전 3개월 평균보다 나쁜 지표.
+    m = monthly(t).loc[:C.PERIOD[1][:7]]
+    if len(m) >= 6:
+        recent, prior = m.tail(3), m.iloc[-6:-3]
+        for col in m.columns:
+            r, p = recent[col].mean(), prior[col].mean()
+            worse = (r > p) if col in HIGHER_IS_WORSE else (r < p)
+            if not worse:
+                continue
+            reject = None
+            if col == "전환율":
+                reject = ("최근월 리드는 아직 계약까지 이어질 시간이 다 지나지 않았다 — "
+                          "성과 악화가 아니라 관측 기간 미달일 수 있다")
+            elif abs(r - p) < (0.1 * abs(p) if p else 0):
+                reject = "월별 표본이 작아(70~100건대) 이 정도 차이는 우연 범위일 수 있다"
+
+            # 규모 — 지표 성격에 따라 "건수"로 환산하는 방식이 다르다.
+            if col == "리드 수":
+                # 이미 월별 건수다. 그대로 연환산한다.
+                scale = _annual(abs(p - r))
+            elif col in ("전환율", "납부이행률"):
+                # %p 차이를 그 지표의 모집단(월평균 리드 수)에 곱해 건수로 바꾼다.
+                scale = _annual(abs(p - r) / 100 * m["리드 수"].tail(3).mean())
+            else:
+                # 일(day) 단위 등 건수로 직접 못 바꾸는 지표 — 영향받는 계약 건수로 대신한다.
+                scale = _annual(t["contracts"].contract_id.nunique())
+
+            topics.append({
+                "키": f"trend_{col}", "제목": f"{col} 최근 3개월 하락",
+                "한줄": f"최근 3개월 평균 {r:.2f} vs 직전 3개월 평균 {p:.2f}",
+                "규모_연간건수": round(scale, 1),
+                "근거축": None, "구간": None, "기각사유": reject,
+            })
+
+    accepted = sorted([x for x in topics if not x["기각사유"]],
+                      key=lambda x: x["규모_연간건수"], reverse=True)
+    rejected = sorted([x for x in topics if x["기각사유"]],
+                      key=lambda x: x["규모_연간건수"], reverse=True)
+    return accepted + rejected
+
+
+@st.cache_data(show_spinner=False)
+def topic_evidence(t: dict, topic_key: str) -> dict:
+    """주제 하나에 딸린 근거를 한 번에 모아 돌려준다. ★ Day3 실습 A.
+
+    조회만 한다 — 문장을 만들지 않는다. 없는 것은 None + 사유.
+
+    반환: {"현황": DataFrame, "원인": DataFrame|None, "원인_사유": str|None,
+           "규모_연간건수": float, "규모_가정": list[str], "추세": DataFrame}
+    """
+    topics = {x["키"]: x for x in proposal_topics(t)}
+    topic = topics.get(topic_key)
+    if topic is None:
+        return {"현황": None, "원인": None, "원인_사유": "알 수 없는 주제 키입니다.",
+                "규모_연간건수": None, "규모_가정": [], "추세": None}
+
+    현황 = funnel(t)
+    원인, 원인_사유 = None, None
+    if topic["근거축"]:
+        step_from, step_to = topic["구간"]
+        원인 = funnel_by(t, topic["근거축"], step_from, step_to)
+    else:
+        원인_사유 = "이 주제는 축으로 쪼개지 않았다 — 근거축이 정해지지 않았다."
+
+    가정 = []
+    if topic["키"].startswith("dim_") or topic["키"] == "funnel_gap":
+        가정.append("하위 칸이 상위 칸과 같은 전환율을 보였다면 늘었을 건수로 계산했다"
+                    "(가정: 배정 구조는 그대로 두고 전환율만 개선된다고 봄)")
+    elif topic["키"].startswith("threshold_"):
+        가정.append("영향받는 모집단을 전체 계약 건수로 잡았다"
+                    "(가정: 이 지표 초과가 전체 계약에 고르게 영향을 준다고 봄)")
+
+    m = monthly(t).loc[:C.PERIOD[1][:7]]
+    return {
+        "현황": 현황, "원인": 원인, "원인_사유": 원인_사유,
+        "규모_연간건수": topic["규모_연간건수"], "규모_가정": 가정,
+        "추세": m.tail(12),
+    }
