@@ -814,7 +814,12 @@ def proposal_topics(t: dict) -> list[dict]:
         top = trusted.loc[trusted.전환율.idxmax()]
         bot = trusted.loc[trusted.전환율.idxmin()]
         gap = top.전환율 - bot.전환율
-        extra = bot.도달 * gap  # 하위 칸이 상위 칸 수준이었다면 늘었을 전환(관측 기간 전체)
+        # ★ 규모는 "최저 칸 하나"가 아니라 "최고 칸보다 낮은 칸 전부"가 최고 칸
+        # 수준으로 개선된다고 볼 때의 합계다 — 최저 칸 하나만 보면 개선 규모를
+        # 실제보다 작게 잡아 "사업적 임팩트가 안 보인다"는 지적을 받는다
+        # (9주차 Day5, 외부 검토에서 지적된 것을 반영해 넓혔다).
+        below = trusted[trusted.전환율 < top.전환율]
+        extra = (below.도달 * (top.전환율 - below.전환율)).sum()
         topics.append({
             "키": f"dim_{dim}", "제목": f"{dim}별 전환율 격차",
             "한줄": (f"{dim} {bot[dim]}({bot.전환율*100:.1f}%) vs "
